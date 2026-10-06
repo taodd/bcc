@@ -7,12 +7,24 @@
 #define MAX_ENTRIES		10240
 #define MAX_PID_NR		30
 #define MAX_TID_NR		30
+#define PERF_MAX_STACK_DEPTH	127
 
 struct key_t {
 	__u32 pid;
 	int user_stack_id;
 	int kern_stack_id;
 	char name[TASK_COMM_LEN];
+};
+
+struct stack_event {
+	__u32 pid;
+	__u32 tid;
+	__u32 cpu;
+	char name[TASK_COMM_LEN];
+	__s32 kstack_sz;
+	__s32 ustack_sz;
+	__u64 kstack[PERF_MAX_STACK_DEPTH];
+	__u64 ustack[PERF_MAX_STACK_DEPTH];
 };
 
 #endif /* __PROFILE_H */
