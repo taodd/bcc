@@ -10,7 +10,6 @@
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_tracing.h>
 #include "profile.h"
-#include "maps.bpf.h"
 
 const volatile bool kernel_stacks_only = false;
 const volatile bool user_stacks_only = false;
@@ -18,7 +17,6 @@ const volatile bool include_idle = false;
 const volatile bool filter_by_pid = false;
 const volatile bool filter_by_tid = false;
 const volatile bool use_pidns = false;
-const volatile bool use_ringbuf = true;
 const volatile __u64 pidns_dev = 0;
 const volatile __u64 pidns_ino = 0;
 
@@ -28,18 +26,6 @@ struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 16 * 1024 * 1024);
 } events SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_STACK_TRACE);
-	__type(key, u32);
-} stackmap SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__type(key, struct key_t);
-	__type(value, u64);
-	__uint(max_entries, MAX_ENTRIES);
-} counts SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -58,9 +44,6 @@ struct {
 SEC("perf_event")
 int do_perf_event(struct bpf_perf_event_data *ctx)
 {
-	u64 *valp;
-	static const u64 zero;
-	struct key_t key = {};
 	u64 id;
 	u32 pid;
 	u32 tid;
@@ -85,54 +68,32 @@ int do_perf_event(struct bpf_perf_event_data *ctx)
 	if (filter_by_tid && !bpf_map_lookup_elem(&tids, &tid))
 		return 0;
 
-	if (use_ringbuf) {
-		struct stack_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-		if (!e) {
-			__sync_fetch_and_add(&dropped, 1);
-			return 0;
-		}
-
-		e->pid = pid;
-		e->tid = tid;
-		e->cpu = bpf_get_smp_processor_id();
-		bpf_get_current_comm(&e->name, sizeof(e->name));
-
-		if (user_stacks_only) {
-			e->kstack_sz = 0;
-		} else {
-			long kbytes = bpf_get_stack(ctx, e->kstack, sizeof(e->kstack), 0);
-			e->kstack_sz = (kbytes > 0) ? (kbytes / sizeof(__u64)) : (int)kbytes;
-		}
-
-		if (kernel_stacks_only) {
-			e->ustack_sz = 0;
-		} else {
-			long ubytes = bpf_get_stack(ctx, e->ustack, sizeof(e->ustack), BPF_F_USER_STACK);
-			e->ustack_sz = (ubytes > 0) ? (ubytes / sizeof(__u64)) : (int)ubytes;
-		}
-
-		bpf_ringbuf_submit(e, BPF_RB_NO_WAKEUP);
+	struct stack_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	if (!e) {
+		__sync_fetch_and_add(&dropped, 1);
 		return 0;
 	}
 
-	key.pid = pid;
-	bpf_get_current_comm(&key.name, sizeof(key.name));
+	e->pid = pid;
+	e->tid = tid;
+	e->cpu = bpf_get_smp_processor_id();
+	bpf_get_current_comm(&e->name, sizeof(e->name));
 
-	if (user_stacks_only)
-		key.kern_stack_id = -1;
-	else
-		key.kern_stack_id = bpf_get_stackid(&ctx->regs, &stackmap, 0);
+	if (user_stacks_only) {
+		e->kstack_sz = 0;
+	} else {
+		long kbytes = bpf_get_stack(ctx, e->kstack, sizeof(e->kstack), 0);
+		e->kstack_sz = (kbytes > 0) ? (kbytes / sizeof(__u64)) : (int)kbytes;
+	}
 
-	if (kernel_stacks_only)
-		key.user_stack_id = -1;
-	else
-		key.user_stack_id = bpf_get_stackid(&ctx->regs, &stackmap,
-						    BPF_F_USER_STACK);
+	if (kernel_stacks_only) {
+		e->ustack_sz = 0;
+	} else {
+		long ubytes = bpf_get_stack(ctx, e->ustack, sizeof(e->ustack), BPF_F_USER_STACK);
+		e->ustack_sz = (ubytes > 0) ? (ubytes / sizeof(__u64)) : (int)ubytes;
+	}
 
-	valp = bpf_map_lookup_or_try_init(&counts, &key, &zero);
-	if (valp)
-		__sync_fetch_and_add(valp, 1);
-
+	bpf_ringbuf_submit(e, BPF_RB_NO_WAKEUP);
 	return 0;
 }
 

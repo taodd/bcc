@@ -24,31 +24,8 @@
 #include "trace_helpers.h"
 
 #define OPT_PERF_MAX_STACK_DEPTH	1 /* --perf-max-stack-depth */
-#define OPT_STACK_STORAGE_SIZE		2 /* --stack-storage-size */
-#define OPT_LEGACY_STACKMAP		3 /* --legacy-stackmap */
 
 #define SYM_INFO_LEN			2048
-
-/*
- * -EFAULT in get_stackid normally means the stack-trace is not available,
- * such as getting kernel stack trace in user mode
- */
-#define STACK_ID_EFAULT(stack_id)	(stack_id == -EFAULT)
-
-#define STACK_ID_ERR(stack_id)		((stack_id < 0) && !STACK_ID_EFAULT(stack_id))
-
-/* hash collision (-EEXIST) suggests that stack map size may be too small */
-#define CHECK_STACK_COLLISION(ustack_id, kstack_id)	\
-	(kstack_id == -EEXIST || ustack_id == -EEXIST)
-
-#define MISSING_STACKS(ustack_id, kstack_id)	\
-	(!env.user_stacks_only && STACK_ID_ERR(kstack_id)) + (!env.kernel_stacks_only && STACK_ID_ERR(ustack_id))
-
-/* This structure combines key_t and count which should be sorted together */
-struct key_ext_t {
-	struct key_t k;
-	__u64 v;
-};
 
 /* User-space aggregation key and entry for streaming ringbuf mode */
 struct user_stack_key {
@@ -95,7 +72,6 @@ static struct env {
 	pid_t tids[MAX_TID_NR];
 	bool user_stacks_only;
 	bool kernel_stacks_only;
-	int stack_storage_size;
 	int perf_max_stack_depth;
 	int duration;
 	bool verbose;
@@ -105,15 +81,12 @@ static struct env {
 	bool include_idle;
 	int cpu;
 	bool folded;
-	bool ringbuf;
 } env = {
-	.stack_storage_size = 1024,
 	.perf_max_stack_depth = 127,
 	.duration = INT_MAX,
 	.freq = 1,
 	.sample_freq = 49,
 	.cpu = -1,
-	.ringbuf = true,
 };
 
 const char *argp_program_version = "profile 0.2 (ringbuf streaming)";
@@ -125,14 +98,13 @@ const char argp_program_doc[] =
 "USAGE: profile [OPTIONS...] [duration]\n"
 "EXAMPLES:\n"
 "    profile             # profile stack traces at 49 Hertz using ringbuf until Ctrl-C\n"
-"    profile -F 99       # profile stack traces at 99 Hertz\n"
+"    profile -F 997      # profile stack traces at 997 Hertz\n"
 "    profile 5           # profile at 49 Hertz for 5 seconds only\n"
 "    profile -f          # output in folded format for flame graphs\n"
 "    profile -p 185      # only profile process with PID 185\n"
 "    profile -L 185      # only profile thread with TID 185\n"
 "    profile -U          # only show user space stacks (no kernel)\n"
-"    profile -K          # only show kernel space stacks (no user)\n"
-"    profile --legacy-stackmap # use legacy in-kernel BPF_MAP_TYPE_STACK_TRACE\n";
+"    profile -K          # only show kernel space stacks (no user)\n";
 
 static const struct argp_option opts[] = {
 	{ "pid", 'p', "PID", 0, "profile processes with one or more comma-separated PIDs only", 0 },
@@ -145,12 +117,6 @@ static const struct argp_option opts[] = {
 	{ "delimited", 'd', NULL, 0, "insert delimiter between kernel/user stacks", 0 },
 	{ "include-idle ", 'I', NULL, 0, "include CPU idle stacks", 0 },
 	{ "folded", 'f', NULL, 0, "output folded format, one line per stack (for flame graphs)", 0 },
-	{ "ringbuf", 'R', NULL, 0,
-	  "stream stack traces via BPF ring buffer to user space (OTel approach, default: enabled)", 0 },
-	{ "legacy-stackmap", OPT_LEGACY_STACKMAP, NULL, 0,
-	  "use legacy in-kernel BPF_MAP_TYPE_STACK_TRACE accumulation", 0 },
-	{ "stack-storage-size", OPT_STACK_STORAGE_SIZE, "STACK-STORAGE-SIZE", 0,
-	  "the number of unique stack traces in legacy mode (default 1024)", 0 },
 	{ "cpu", 'C', "CPU", 0, "cpu number to run profile on", 0 },
 	{ "perf-max-stack-depth", OPT_PERF_MAX_STACK_DEPTH,
 	  "PERF-MAX-STACK-DEPTH", 0, "the limit for both kernel and user stack traces (default 127)", 0 },
@@ -322,25 +288,11 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 	case 'f':
 		env.folded = true;
 		break;
-	case 'R':
-		env.ringbuf = true;
-		break;
-	case OPT_LEGACY_STACKMAP:
-		env.ringbuf = false;
-		break;
 	case OPT_PERF_MAX_STACK_DEPTH:
 		errno = 0;
 		env.perf_max_stack_depth = strtol(arg, NULL, 10);
 		if (errno) {
 			fprintf(stderr, "invalid perf max stack depth: %s\n", arg);
-			argp_usage(state);
-		}
-		break;
-	case OPT_STACK_STORAGE_SIZE:
-		errno = 0;
-		env.stack_storage_size = strtol(arg, NULL, 10);
-		if (errno) {
-			fprintf(stderr, "invalid stack storage size: %s\n", arg);
 			argp_usage(state);
 		}
 		break;
@@ -417,40 +369,6 @@ static void sig_handler(int sig)
 	exiting = true;
 }
 
-static int cmp_counts(const void *a, const void *b)
-{
-	const __u64 x = ((struct key_ext_t *) a)->v;
-	const __u64 y = ((struct key_ext_t *) b)->v;
-
-	/* descending order */
-	return y - x;
-}
-
-static int read_counts_map(int fd, struct key_ext_t *items, __u32 *count)
-{
-	struct key_t empty = {};
-	struct key_t *lookup_key = &empty;
-	int i = 0;
-	int err;
-
-	while (bpf_map_get_next_key(fd, lookup_key, &items[i].k) == 0) {
-		err = bpf_map_lookup_elem(fd, &items[i].k, &items[i].v);
-		if (err < 0) {
-			fprintf(stderr, "failed to lookup counts: %d\n", err);
-			return -err;
-		}
-
-		if (items[i].v == 0)
-			continue;
-
-		lookup_key = &items[i].k;
-		i++;
-	}
-
-	*count = i;
-	return 0;
-}
-
 static const char *ksymname(unsigned long addr)
 {
 	const struct ksym *ksym = ksyms__map_addr(ksyms, addr);
@@ -499,139 +417,6 @@ static const char *usymname(unsigned long addr)
 	}
 
 	return usyminfo(addr);
-}
-
-static void print_stacktrace(unsigned long *ip, symname_fn_t symname, struct fmt_t *f)
-{
-	int i;
-
-	if (!f->folded) {
-		for (i = 0; ip[i] && i < env.perf_max_stack_depth; i++)
-			pr_format(symname(ip[i]), f);
-		return;
-	} else {
-		for (i = env.perf_max_stack_depth - 1; i >= 0; i--) {
-			if (!ip[i])
-				continue;
-
-			pr_format(symname(ip[i]), f);
-		}
-	}
-}
-
-static bool print_user_stacktrace(struct key_t *event, int stack_map,
-				  unsigned long *ip, struct fmt_t *f, bool delim)
-{
-	if (env.kernel_stacks_only || STACK_ID_EFAULT(event->user_stack_id))
-		return false;
-
-	if (delim)
-		pr_format(f->delim, f);
-
-	if (bpf_map_lookup_elem(stack_map, &event->user_stack_id, ip) != 0) {
-		pr_format("[Missed User Stack]", f);
-	} else {
-		syms = syms_cache__get_syms(syms_cache, event->pid);
-		if (syms)
-			print_stacktrace(ip, usymname, f);
-		else if (!f->folded)
-			fprintf(stderr, "failed to get syms\n");
-	}
-
-	return true;
-}
-
-static bool print_kern_stacktrace(struct key_t *event, int stack_map,
-				  unsigned long *ip, struct fmt_t *f, bool delim)
-{
-	if (env.user_stacks_only || STACK_ID_EFAULT(event->kern_stack_id))
-		return false;
-
-	if (delim)
-		pr_format(f->delim, f);
-
-	if (bpf_map_lookup_elem(stack_map, &event->kern_stack_id, ip) != 0)
-		pr_format("[Missed Kernel Stack]", f);
-	else
-		print_stacktrace(ip, ksymname, f);
-
-	return true;
-}
-
-static int print_count(struct key_t *event, __u64 count, int stack_map, bool folded)
-{
-	unsigned long *ip;
-	int ret;
-	struct fmt_t *fmt = &stacktrace_formats[folded];
-
-	ip = calloc(env.perf_max_stack_depth, sizeof(unsigned long));
-	if (!ip) {
-		fprintf(stderr, "failed to alloc ip\n");
-		return -ENOMEM;
-	}
-
-	if (!folded) {
-		/* multi-line stack output */
-		ret = print_kern_stacktrace(event, stack_map, ip, fmt, false);
-		print_user_stacktrace(event, stack_map, ip, fmt, ret && env.delimiter);
-		printf("    %-16s %s (%d)\n", "-", event->name, event->pid);
-		printf("        %lld\n\n", count);
-	} else {
-		/* folded stack output */
-		printf("%s", event->name);
-		ret = print_user_stacktrace(event, stack_map, ip, fmt, false);
-		print_kern_stacktrace(event, stack_map, ip, fmt, ret && env.delimiter);
-		printf(" %lld\n", count);
-	}
-
-	free(ip);
-
-	return 0;
-}
-
-static int print_counts(int counts_map, int stack_map)
-{
-	struct key_ext_t *counts;
-	struct key_t *event;
-	__u64 count;
-	__u32 nr_count = MAX_ENTRIES;
-	size_t nr_missing_stacks = 0;
-	bool has_collision = false;
-	int i, ret = 0;
-
-	counts = calloc(MAX_ENTRIES, sizeof(struct key_ext_t));
-	if (!counts) {
-		fprintf(stderr, "Out of memory\n");
-		return -ENOMEM;
-	}
-
-	ret = read_counts_map(counts_map, counts, &nr_count);
-	if (ret)
-		goto cleanup;
-
-	qsort(counts, nr_count, sizeof(struct key_ext_t), cmp_counts);
-
-	for (i = 0; i < nr_count; i++) {
-		event = &counts[i].k;
-		count = counts[i].v;
-
-		print_count(event, count, stack_map, env.folded);
-
-		/* handle stack id errors */
-		nr_missing_stacks += MISSING_STACKS(event->user_stack_id, event->kern_stack_id);
-		has_collision = CHECK_STACK_COLLISION(event->user_stack_id, event->kern_stack_id);
-	}
-
-	if (nr_missing_stacks > 0) {
-		fprintf(stderr, "WARNING: %zu stack traces could not be displayed.%s\n",
-			nr_missing_stacks, has_collision ?
-			" Consider increasing --stack-storage-size.":"");
-	}
-
-cleanup:
-	free(counts);
-
-	return ret;
 }
 
 static int cmp_user_stack_entries(const void *a, const void *b)
@@ -763,11 +548,6 @@ static void print_headers()
 	if (env.cpu != -1)
 		printf(" on CPU#%d", env.cpu);
 
-	if (env.ringbuf)
-		printf(" [mode: streaming ringbuf]");
-	else
-		printf(" [mode: legacy stackmap]");
-
 	if (env.duration < INT_MAX)
 		printf(" for %d secs.\n", env.duration);
 	else
@@ -821,21 +601,10 @@ int main(int argc, char **argv)
 	obj->rodata->user_stacks_only = env.user_stacks_only;
 	obj->rodata->kernel_stacks_only = env.kernel_stacks_only;
 	obj->rodata->include_idle = env.include_idle;
-	obj->rodata->use_ringbuf = env.ringbuf;
 	if (env.pids[0])
 		obj->rodata->filter_by_pid = true;
 	else if (env.tids[0])
 		obj->rodata->filter_by_tid = true;
-
-	bpf_map__set_value_size(obj->maps.stackmap,
-				env.perf_max_stack_depth * sizeof(unsigned long));
-	if (env.ringbuf) {
-		/* In streaming ringbuf mode, shrink legacy maps to 1 entry to save kernel RAM */
-		bpf_map__set_max_entries(obj->maps.stackmap, 1);
-		bpf_map__set_max_entries(obj->maps.counts, 1);
-	} else {
-		bpf_map__set_max_entries(obj->maps.stackmap, env.stack_storage_size);
-	}
 
 	err = set_pidns(obj);
 	if (err && env.verbose)
@@ -887,50 +656,43 @@ int main(int argc, char **argv)
 	if (!env.folded)
 		print_headers();
 
-	if (env.ringbuf) {
-		rb = ring_buffer__new(bpf_map__fd(obj->maps.events), handle_event, NULL, NULL);
-		if (!rb) {
-			fprintf(stderr, "failed to create ring buffer: %s\n", strerror(errno));
-			goto cleanup;
-		}
+	rb = ring_buffer__new(bpf_map__fd(obj->maps.events), handle_event, NULL, NULL);
+	if (!rb) {
+		fprintf(stderr, "failed to create ring buffer: %s\n", strerror(errno));
+		goto cleanup;
+	}
 
-		time_t start = time(NULL);
-		while (!exiting) {
-			err = ring_buffer__poll(rb, 100 /* timeout ms */);
-			if (err < 0 && err != -EINTR) {
-				fprintf(stderr, "error polling ring buffer: %d\n", err);
-				break;
-			}
-			if (env.duration != INT_MAX && (time(NULL) - start) >= env.duration)
-				break;
+	time_t start = time(NULL);
+	while (!exiting) {
+		err = ring_buffer__poll(rb, 100 /* timeout ms */);
+		if (err < 0 && err != -EINTR) {
+			fprintf(stderr, "error polling ring buffer: %d\n", err);
+			break;
 		}
+		if (env.duration != INT_MAX && (time(NULL) - start) >= env.duration)
+			break;
+	}
 
-		/* Detach perf events first so no new samples arrive */
-		if (env.cpu != -1) {
-			bpf_link__destroy(links[env.cpu]);
-			links[env.cpu] = NULL;
-		} else {
-			for (i = 0; i < nr_cpus; i++) {
-				bpf_link__destroy(links[i]);
-				links[i] = NULL;
-			}
-		}
-
-		/* Drain any remaining events in ring buffer */
-		ring_buffer__consume(rb);
-		ring_buffer__free(rb);
-		rb = NULL;
-
-		print_ringbuf_counts(env.folded);
-		if (obj->bss && obj->bss->dropped > 0) {
-			fprintf(stderr, "WARNING: %llu samples dropped due to ring buffer full\n",
-				(unsigned long long)obj->bss->dropped);
-		}
+	/* Detach perf events first so no new samples arrive */
+	if (env.cpu != -1) {
+		bpf_link__destroy(links[env.cpu]);
+		links[env.cpu] = NULL;
 	} else {
-		/* Legacy mode */
-		sleep(env.duration);
-		print_counts(bpf_map__fd(obj->maps.counts),
-			     bpf_map__fd(obj->maps.stackmap));
+		for (i = 0; i < nr_cpus; i++) {
+			bpf_link__destroy(links[i]);
+			links[i] = NULL;
+		}
+	}
+
+	/* Drain any remaining events in ring buffer */
+	ring_buffer__consume(rb);
+	ring_buffer__free(rb);
+	rb = NULL;
+
+	print_ringbuf_counts(env.folded);
+	if (obj->bss && obj->bss->dropped > 0) {
+		fprintf(stderr, "WARNING: %llu samples dropped due to ring buffer full\n",
+			(unsigned long long)obj->bss->dropped);
 	}
 
 cleanup:
