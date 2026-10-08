@@ -22,6 +22,8 @@ const volatile bool use_ringbuf = true;
 const volatile __u64 pidns_dev = 0;
 const volatile __u64 pidns_ino = 0;
 
+__u64 dropped = 0;
+
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 16 * 1024 * 1024);
@@ -85,8 +87,10 @@ int do_perf_event(struct bpf_perf_event_data *ctx)
 
 	if (use_ringbuf) {
 		struct stack_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-		if (!e)
+		if (!e) {
+			__sync_fetch_and_add(&dropped, 1);
 			return 0;
+		}
 
 		e->pid = pid;
 		e->tid = tid;
@@ -107,7 +111,7 @@ int do_perf_event(struct bpf_perf_event_data *ctx)
 			e->ustack_sz = (ubytes > 0) ? (ubytes / sizeof(__u64)) : (int)ubytes;
 		}
 
-		bpf_ringbuf_submit(e, 0);
+		bpf_ringbuf_submit(e, BPF_RB_NO_WAKEUP);
 		return 0;
 	}
 

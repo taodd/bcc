@@ -922,6 +922,10 @@ int main(int argc, char **argv)
 		rb = NULL;
 
 		print_ringbuf_counts(env.folded);
+		if (obj->bss && obj->bss->dropped > 0) {
+			fprintf(stderr, "WARNING: %llu samples dropped due to ring buffer full\n",
+				(unsigned long long)obj->bss->dropped);
+		}
 	} else {
 		/* Legacy mode */
 		sleep(env.duration);
