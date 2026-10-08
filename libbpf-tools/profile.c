@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <inttypes.h>
 #include <unistd.h>
 #include <time.h>
@@ -24,6 +25,7 @@
 
 #define OPT_PERF_MAX_STACK_DEPTH	1 /* --perf-max-stack-depth */
 #define OPT_STACK_STORAGE_SIZE		2 /* --stack-storage-size */
+#define OPT_LEGACY_STACKMAP		3 /* --legacy-stackmap */
 
 #define SYM_INFO_LEN			2048
 
@@ -47,6 +49,29 @@ struct key_ext_t {
 	struct key_t k;
 	__u64 v;
 };
+
+/* User-space aggregation key and entry for streaming ringbuf mode */
+struct user_stack_key {
+	__u32 pid;
+	char name[TASK_COMM_LEN];
+	__s32 kstack_sz;
+	__s32 ustack_sz;
+	unsigned long kstack[PERF_MAX_STACK_DEPTH];
+	unsigned long ustack[PERF_MAX_STACK_DEPTH];
+};
+
+struct user_stack_entry {
+	struct user_stack_key key;
+	__u64 count;
+	struct user_stack_entry *next;
+};
+
+#define USER_STACK_HASH_BITS 16
+#define USER_STACK_HASH_BUCKETS (1 << USER_STACK_HASH_BITS)
+static struct user_stack_entry *user_stack_hash[USER_STACK_HASH_BUCKETS];
+static size_t total_unique_stacks = 0;
+static size_t total_samples = 0;
+static volatile bool exiting = false;
 
 typedef const char* (*symname_fn_t)(unsigned long);
 
@@ -80,6 +105,7 @@ static struct env {
 	bool include_idle;
 	int cpu;
 	bool folded;
+	bool ringbuf;
 } env = {
 	.stack_storage_size = 1024,
 	.perf_max_stack_depth = 127,
@@ -87,9 +113,10 @@ static struct env {
 	.freq = 1,
 	.sample_freq = 49,
 	.cpu = -1,
+	.ringbuf = true,
 };
 
-const char *argp_program_version = "profile 0.1";
+const char *argp_program_version = "profile 0.2 (ringbuf streaming)";
 const char *argp_program_bug_address =
 	"https://github.com/iovisor/bcc/tree/master/libbpf-tools";
 const char argp_program_doc[] =
@@ -97,15 +124,15 @@ const char argp_program_doc[] =
 "\n"
 "USAGE: profile [OPTIONS...] [duration]\n"
 "EXAMPLES:\n"
-"    profile             # profile stack traces at 49 Hertz until Ctrl-C\n"
+"    profile             # profile stack traces at 49 Hertz using ringbuf until Ctrl-C\n"
 "    profile -F 99       # profile stack traces at 99 Hertz\n"
-"    profile -c 1000000  # profile stack traces every 1 in a million events\n"
 "    profile 5           # profile at 49 Hertz for 5 seconds only\n"
 "    profile -f          # output in folded format for flame graphs\n"
 "    profile -p 185      # only profile process with PID 185\n"
 "    profile -L 185      # only profile thread with TID 185\n"
 "    profile -U          # only show user space stacks (no kernel)\n"
-"    profile -K          # only show kernel space stacks (no user)\n";
+"    profile -K          # only show kernel space stacks (no user)\n"
+"    profile --legacy-stackmap # use legacy in-kernel BPF_MAP_TYPE_STACK_TRACE\n";
 
 static const struct argp_option opts[] = {
 	{ "pid", 'p', "PID", 0, "profile processes with one or more comma-separated PIDs only", 0 },
@@ -118,8 +145,12 @@ static const struct argp_option opts[] = {
 	{ "delimited", 'd', NULL, 0, "insert delimiter between kernel/user stacks", 0 },
 	{ "include-idle ", 'I', NULL, 0, "include CPU idle stacks", 0 },
 	{ "folded", 'f', NULL, 0, "output folded format, one line per stack (for flame graphs)", 0 },
+	{ "ringbuf", 'R', NULL, 0,
+	  "stream stack traces via BPF ring buffer to user space (OTel approach, default: enabled)", 0 },
+	{ "legacy-stackmap", OPT_LEGACY_STACKMAP, NULL, 0,
+	  "use legacy in-kernel BPF_MAP_TYPE_STACK_TRACE accumulation", 0 },
 	{ "stack-storage-size", OPT_STACK_STORAGE_SIZE, "STACK-STORAGE-SIZE", 0,
-	  "the number of unique stack traces that can be stored and displayed (default 1024)", 0 },
+	  "the number of unique stack traces in legacy mode (default 1024)", 0 },
 	{ "cpu", 'C', "CPU", 0, "cpu number to run profile on", 0 },
 	{ "perf-max-stack-depth", OPT_PERF_MAX_STACK_DEPTH,
 	  "PERF-MAX-STACK-DEPTH", 0, "the limit for both kernel and user stack traces (default 127)", 0 },
@@ -132,6 +163,95 @@ struct ksyms *ksyms;
 struct syms_cache *syms_cache;
 struct syms *syms;
 static char syminfo[SYM_INFO_LEN];
+
+static inline uint32_t hash_stack(const struct user_stack_key *k)
+{
+	uint32_t hash = 2166136261u;
+	hash ^= k->pid;
+	hash *= 16777619u;
+	for (int i = 0; i < TASK_COMM_LEN && k->name[i]; i++) {
+		hash ^= (uint8_t)k->name[i];
+		hash *= 16777619u;
+	}
+	hash ^= (uint32_t)k->kstack_sz;
+	hash *= 16777619u;
+	for (int i = 0; i < k->kstack_sz; i++) {
+		uint64_t ip = k->kstack[i];
+		hash ^= (uint32_t)(ip & 0xffffffff);
+		hash *= 16777619u;
+		hash ^= (uint32_t)(ip >> 32);
+		hash *= 16777619u;
+	}
+	hash ^= (uint32_t)k->ustack_sz;
+	hash *= 16777619u;
+	for (int i = 0; i < k->ustack_sz; i++) {
+		uint64_t ip = k->ustack[i];
+		hash ^= (uint32_t)(ip & 0xffffffff);
+		hash *= 16777619u;
+		hash ^= (uint32_t)(ip >> 32);
+		hash *= 16777619u;
+	}
+	return hash;
+}
+
+static inline bool stack_keys_equal(const struct user_stack_key *a, const struct user_stack_key *b)
+{
+	if (a->pid != b->pid || a->kstack_sz != b->kstack_sz || a->ustack_sz != b->ustack_sz)
+		return false;
+	if (strcmp(a->name, b->name) != 0)
+		return false;
+	if (a->kstack_sz > 0 && memcmp(a->kstack, b->kstack, a->kstack_sz * sizeof(unsigned long)) != 0)
+		return false;
+	if (a->ustack_sz > 0 && memcmp(a->ustack, b->ustack, a->ustack_sz * sizeof(unsigned long)) != 0)
+		return false;
+	return true;
+}
+
+static int handle_event(void *ctx, void *data, size_t data_sz)
+{
+	const struct stack_event *e = data;
+	struct user_stack_key key;
+	memset(&key, 0, sizeof(key));
+	key.pid = e->pid;
+	memcpy(key.name, e->name, sizeof(key.name));
+	key.name[sizeof(key.name) - 1] = '\0';
+	key.kstack_sz = (e->kstack_sz > 0) ? e->kstack_sz : 0;
+	key.ustack_sz = (e->ustack_sz > 0) ? e->ustack_sz : 0;
+
+	if (key.kstack_sz > env.perf_max_stack_depth)
+		key.kstack_sz = env.perf_max_stack_depth;
+	if (key.ustack_sz > env.perf_max_stack_depth)
+		key.ustack_sz = env.perf_max_stack_depth;
+
+	for (int i = 0; i < key.kstack_sz; i++)
+		key.kstack[i] = (unsigned long)e->kstack[i];
+	for (int i = 0; i < key.ustack_sz; i++)
+		key.ustack[i] = (unsigned long)e->ustack[i];
+
+	uint32_t h = hash_stack(&key) & (USER_STACK_HASH_BUCKETS - 1);
+	struct user_stack_entry *entry = user_stack_hash[h];
+	while (entry) {
+		if (stack_keys_equal(&entry->key, &key)) {
+			entry->count++;
+			total_samples++;
+			return 0;
+		}
+		entry = entry->next;
+	}
+
+	entry = calloc(1, sizeof(*entry));
+	if (!entry) {
+		fprintf(stderr, "failed to alloc user_stack_entry\n");
+		return 0;
+	}
+	entry->key = key;
+	entry->count = 1;
+	entry->next = user_stack_hash[h];
+	user_stack_hash[h] = entry;
+	total_unique_stacks++;
+	total_samples++;
+	return 0;
+}
 
 static error_t parse_arg(int key, char *arg, struct argp_state *state)
 {
@@ -201,6 +321,12 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		break;
 	case 'f':
 		env.folded = true;
+		break;
+	case 'R':
+		env.ringbuf = true;
+		break;
+	case OPT_LEGACY_STACKMAP:
+		env.ringbuf = false;
 		break;
 	case OPT_PERF_MAX_STACK_DEPTH:
 		errno = 0;
@@ -288,6 +414,7 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
 
 static void sig_handler(int sig)
 {
+	exiting = true;
 }
 
 static int cmp_counts(const void *a, const void *b)
@@ -507,6 +634,90 @@ cleanup:
 	return ret;
 }
 
+static int cmp_user_stack_entries(const void *a, const void *b)
+{
+	const struct user_stack_entry *e1 = *(const struct user_stack_entry **)a;
+	const struct user_stack_entry *e2 = *(const struct user_stack_entry **)b;
+	if (e1->count > e2->count)
+		return -1;
+	if (e1->count < e2->count)
+		return 1;
+	return 0;
+}
+
+static void print_ringbuf_counts(bool folded)
+{
+	if (total_unique_stacks == 0)
+		return;
+
+	struct user_stack_entry **entries = calloc(total_unique_stacks, sizeof(void *));
+	if (!entries) {
+		fprintf(stderr, "Out of memory allocating entries for sorting\n");
+		return;
+	}
+
+	size_t count = 0;
+	for (size_t b = 0; b < USER_STACK_HASH_BUCKETS; b++) {
+		struct user_stack_entry *curr = user_stack_hash[b];
+		while (curr) {
+			if (count < total_unique_stacks)
+				entries[count++] = curr;
+			curr = curr->next;
+		}
+	}
+
+	qsort(entries, count, sizeof(void *), cmp_user_stack_entries);
+
+	struct fmt_t *fmt = &stacktrace_formats[folded];
+	for (size_t i = 0; i < count; i++) {
+		struct user_stack_entry *entry = entries[i];
+		struct user_stack_key *k = &entry->key;
+
+		if (!folded) {
+			/* Multi-line output */
+			bool ret = false;
+			if (!env.user_stacks_only && k->kstack_sz > 0) {
+				for (int s = 0; s < k->kstack_sz; s++)
+					pr_format(ksymname(k->kstack[s]), fmt);
+				ret = true;
+			}
+			if (!env.kernel_stacks_only && k->ustack_sz > 0) {
+				if (ret && env.delimiter)
+					pr_format(fmt->delim, fmt);
+				syms = syms_cache__get_syms(syms_cache, k->pid);
+				for (int s = 0; s < k->ustack_sz; s++) {
+					const char *name = syms ? usymname(k->ustack[s]) : "[unknown]";
+					pr_format(name, fmt);
+				}
+			}
+			printf("    %-16s %s (%d)\n", "-", k->name, k->pid);
+			printf("        %llu\n\n", (unsigned long long)entry->count);
+		} else {
+			/* Folded output: comm;user_stacks (bottom->top);delim;kernel_stacks (bottom->top) count */
+			printf("%s", k->name);
+			bool ret = false;
+			if (!env.kernel_stacks_only && k->ustack_sz > 0) {
+				syms = syms_cache__get_syms(syms_cache, k->pid);
+				for (int s = k->ustack_sz - 1; s >= 0; s--) {
+					const char *name = syms ? usymname(k->ustack[s]) : "[unknown]";
+					pr_format(name, fmt);
+				}
+				ret = true;
+			}
+			if (!env.user_stacks_only && k->kstack_sz > 0) {
+				if (ret && env.delimiter)
+					pr_format(fmt->delim, fmt);
+				for (int s = k->kstack_sz - 1; s >= 0; s--) {
+					pr_format(ksymname(k->kstack[s]), fmt);
+				}
+			}
+			printf(" %llu\n", (unsigned long long)entry->count);
+		}
+	}
+
+	free(entries);
+}
+
 static int set_pidns(const struct profile_bpf *obj)
 {
 	struct stat statbuf;
@@ -552,6 +763,11 @@ static void print_headers()
 	if (env.cpu != -1)
 		printf(" on CPU#%d", env.cpu);
 
+	if (env.ringbuf)
+		printf(" [mode: streaming ringbuf]");
+	else
+		printf(" [mode: legacy stackmap]");
+
 	if (env.duration < INT_MAX)
 		printf(" for %d secs.\n", env.duration);
 	else
@@ -567,6 +783,7 @@ int main(int argc, char **argv)
 	};
 	struct bpf_link *links[MAX_CPU_NR] = {};
 	struct profile_bpf *obj;
+	struct ring_buffer *rb = NULL;
 	int pids_fd, tids_fd;
 	int err, i;
 	__u8 val = 0;
@@ -590,7 +807,7 @@ int main(int argc, char **argv)
 	}
 	if (nr_cpus > MAX_CPU_NR) {
 		fprintf(stderr, "the number of cpu cores is too big, please "
-			"increase MAX_CPU_NR's value and recompile");
+			"increase MAX_CPU_NR's value and recompile\n");
 		return 1;
 	}
 
@@ -604,6 +821,7 @@ int main(int argc, char **argv)
 	obj->rodata->user_stacks_only = env.user_stacks_only;
 	obj->rodata->kernel_stacks_only = env.kernel_stacks_only;
 	obj->rodata->include_idle = env.include_idle;
+	obj->rodata->use_ringbuf = env.ringbuf;
 	if (env.pids[0])
 		obj->rodata->filter_by_pid = true;
 	else if (env.tids[0])
@@ -611,7 +829,13 @@ int main(int argc, char **argv)
 
 	bpf_map__set_value_size(obj->maps.stackmap,
 				env.perf_max_stack_depth * sizeof(unsigned long));
-	bpf_map__set_max_entries(obj->maps.stackmap, env.stack_storage_size);
+	if (env.ringbuf) {
+		/* In streaming ringbuf mode, shrink legacy maps to 1 entry to save kernel RAM */
+		bpf_map__set_max_entries(obj->maps.stackmap, 1);
+		bpf_map__set_max_entries(obj->maps.counts, 1);
+	} else {
+		bpf_map__set_max_entries(obj->maps.stackmap, env.stack_storage_size);
+	}
 
 	err = set_pidns(obj);
 	if (err && env.verbose)
@@ -619,7 +843,7 @@ int main(int argc, char **argv)
 
 	err = profile_bpf__load(obj);
 	if (err) {
-		fprintf(stderr, "failed to load BPF programs\n");
+		fprintf(stderr, "failed to load BPF programs: %d\n", err);
 		goto cleanup;
 	}
 
@@ -663,27 +887,80 @@ int main(int argc, char **argv)
 	if (!env.folded)
 		print_headers();
 
-	/*
-	 * We'll get sleep interrupted when someone presses Ctrl-C.
-	 * (which will be "handled" with noop by sig_handler)
-	 */
-	sleep(env.duration);
+	if (env.ringbuf) {
+		rb = ring_buffer__new(bpf_map__fd(obj->maps.events), handle_event, NULL, NULL);
+		if (!rb) {
+			fprintf(stderr, "failed to create ring buffer: %s\n", strerror(errno));
+			goto cleanup;
+		}
 
-	print_counts(bpf_map__fd(obj->maps.counts),
-		     bpf_map__fd(obj->maps.stackmap));
+		time_t start = time(NULL);
+		while (!exiting) {
+			err = ring_buffer__poll(rb, 100 /* timeout ms */);
+			if (err < 0 && err != -EINTR) {
+				fprintf(stderr, "error polling ring buffer: %d\n", err);
+				break;
+			}
+			if (env.duration != INT_MAX && (time(NULL) - start) >= env.duration)
+				break;
+		}
+
+		/* Detach perf events first so no new samples arrive */
+		if (env.cpu != -1) {
+			bpf_link__destroy(links[env.cpu]);
+			links[env.cpu] = NULL;
+		} else {
+			for (i = 0; i < nr_cpus; i++) {
+				bpf_link__destroy(links[i]);
+				links[i] = NULL;
+			}
+		}
+
+		/* Drain any remaining events in ring buffer */
+		ring_buffer__consume(rb);
+		ring_buffer__free(rb);
+		rb = NULL;
+
+		print_ringbuf_counts(env.folded);
+		if (obj->bss && obj->bss->dropped > 0) {
+			fprintf(stderr, "WARNING: %llu samples dropped due to ring buffer full\n",
+				(unsigned long long)obj->bss->dropped);
+		}
+	} else {
+		/* Legacy mode */
+		sleep(env.duration);
+		print_counts(bpf_map__fd(obj->maps.counts),
+			     bpf_map__fd(obj->maps.stackmap));
+	}
 
 cleanup:
-	if (env.cpu != -1)
-		bpf_link__destroy(links[env.cpu]);
-	else {
-		for (i = 0; i < nr_cpus; i++)
-			bpf_link__destroy(links[i]);
+	if (rb)
+		ring_buffer__free(rb);
+	if (env.cpu != -1) {
+		if (links[env.cpu])
+			bpf_link__destroy(links[env.cpu]);
+	} else {
+		for (i = 0; i < nr_cpus; i++) {
+			if (links[i])
+				bpf_link__destroy(links[i]);
+		}
 	}
 	if (syms_cache)
 		syms_cache__free(syms_cache);
 	if (ksyms)
 		ksyms__free(ksyms);
 	profile_bpf__destroy(obj);
+
+	/* Clean up user space hash table */
+	for (size_t b = 0; b < USER_STACK_HASH_BUCKETS; b++) {
+		struct user_stack_entry *curr = user_stack_hash[b];
+		while (curr) {
+			struct user_stack_entry *tmp = curr;
+			curr = curr->next;
+			free(tmp);
+		}
+		user_stack_hash[b] = NULL;
+	}
 
 	return err != 0;
 }
